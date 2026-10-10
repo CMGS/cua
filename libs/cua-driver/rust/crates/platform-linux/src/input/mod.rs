@@ -4141,6 +4141,17 @@ mod spare_keycode_tests {
         assert_eq!(spare_keycode(&mapping, &[11, 10]), Some(8));
         assert_eq!(spare_keycode(&mapping, &[11, 10, 8]), None);
     }
+
+    #[test]
+    fn spare_keycodes_skip_the_mpx_warm_up_keycode() {
+        let per = 2usize;
+        let mapping = GetKeyboardMappingReply {
+            keysyms_per_keycode: per as u8,
+            sequence: 0,
+            keysyms: vec![0u32; (248 - 8 + 1) * per],
+        };
+        assert_eq!(spare_keycode(&mapping, &[]), Some(247));
+    }
 }
 
 #[cfg(test)]
@@ -4244,7 +4255,7 @@ fn remap_spare_keycode<'a>(
 /// Find a keycode outside `held` whose every keysym slot is NoSymbol (0) — i.e.
 /// completely unused — so borrowing it cannot clobber a real key. Scan
 /// high-to-low: high keycodes are far likelier to be free than the low,
-/// populated ones.
+/// populated ones. The MPX warm-up keycode is never borrowed.
 fn spare_keycode(mapping: &GetKeyboardMappingReply, held: &[u8]) -> Option<u8> {
     let per = mapping.keysyms_per_keycode as usize;
     if per == 0 {
@@ -4256,7 +4267,11 @@ fn spare_keycode(mapping: &GetKeyboardMappingReply, held: &[u8]) -> Option<u8> {
         .enumerate()
         .rev()
         .map(|(i, syms)| ((8 + i) as u8, syms))
-        .find(|(keycode, syms)| syms.iter().all(|&s| s == 0) && !held.contains(keycode))
+        .find(|(keycode, syms)| {
+            *keycode != mpx_keyboard::WARM_UP_KEYCODE
+                && syms.iter().all(|&s| s == 0)
+                && !held.contains(keycode)
+        })
         .map(|(keycode, _)| keycode)
 }
 
