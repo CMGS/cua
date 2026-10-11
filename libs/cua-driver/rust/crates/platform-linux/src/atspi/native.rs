@@ -5585,6 +5585,10 @@ fn native_wayland_origin_attested(pid: u32, xid: u64) -> bool {
 }
 
 pub(crate) fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {
+    x11_window_geometry(xid).map(|(x, y, _, _)| (x, y))
+}
+
+fn x11_window_geometry(xid: u64) -> Option<(i32, i32, i32, i32)> {
     use x11rb::protocol::xproto::*;
     use x11rb::rust_connection::RustConnection;
 
@@ -5596,7 +5600,12 @@ pub(crate) fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {
         .ok()?
         .reply()
         .ok()?;
-    Some((trans.dst_x as i32, trans.dst_y as i32))
+    Some((
+        trans.dst_x as i32,
+        trans.dst_y as i32,
+        i32::from(geom.width),
+        i32::from(geom.height),
+    ))
 }
 
 fn x11_top_level_geometry(xid: u64) -> Option<(i32, i32, i32, i32)> {
@@ -5905,7 +5914,7 @@ async fn web_document_origin_for_visited(
 }
 
 fn screen_extent_rebase(
-    x11_origin: (i32, i32),
+    x11_window: (i32, i32, i32, i32),
     accessible_frame: (i32, i32, i32, i32),
     top_level: Option<(i32, i32, i32, i32)>,
 ) -> Option<(i32, i32)> {
@@ -5914,13 +5923,15 @@ fn screen_extent_rebase(
     // origin by title-bar/CSD extents; rebasing that small decoration delta
     // would move otherwise-correct GTK coordinates off their controls.
     let accessible_frame_origin = (accessible_frame.0, accessible_frame.1);
-    if top_level == Some(accessible_frame) {
+    if top_level == Some(accessible_frame)
+        || (accessible_frame.2, accessible_frame.3) != (x11_window.2, x11_window.3)
+    {
         return None;
     }
     if accessible_frame_origin.0.abs() <= 2 && accessible_frame_origin.1.abs() <= 2 {
         Some((
-            x11_origin.0 - accessible_frame_origin.0,
-            x11_origin.1 - accessible_frame_origin.1,
+            x11_window.0 - accessible_frame_origin.0,
+            x11_window.1 - accessible_frame_origin.1,
         ))
     } else {
         None
@@ -6043,7 +6054,7 @@ async fn element_bounds_for_visited(
     // required window-origin delta. GTK's explicit Window-coordinate
     // path above remains authoritative when available.
     let screen_rebase = if offset.is_none() && !crate::wayland::is_wayland() && xid != 0 {
-        let x11_origin = bounded_blocking(move || x11_window_origin(xid))
+        let x11_window = bounded_blocking(move || x11_window_geometry(xid))
             .await
             .flatten();
         let top_level = bounded_blocking(move || x11_top_level_geometry(xid))
@@ -6057,7 +6068,7 @@ async fn element_bounds_for_visited(
                     "frame" | "window" | "dialog" | "alert" | "file chooser"
                 )
         });
-        if let (Some(origin), Some(frame)) = (x11_origin, frame) {
+        if let (Some(window), Some(frame)) = (x11_window, frame) {
             let accessible_frame = match call(frame.acc.proxies()).await {
                 Some(Ok(proxies)) => match call(proxies.component()).await {
                     Some(Ok(component)) => {
@@ -6070,7 +6081,7 @@ async fn element_bounds_for_visited(
                 },
                 _ => None,
             };
-            accessible_frame.and_then(|frame| screen_extent_rebase(origin, frame, top_level))
+            accessible_frame.and_then(|frame| screen_extent_rebase(window, frame, top_level))
         } else {
             None
         }
@@ -6805,31 +6816,32 @@ mod coord_tests {
     fn screen_extents_are_rebased_from_accessible_frame_to_x11_origin() {
         let frame = Some((600, 50, 800, 600));
         assert_eq!(
-            screen_extent_rebase((604, 80), (0, 0, 792, 566), frame),
+            screen_extent_rebase((604, 80, 792, 566), (0, 0, 792, 566), frame),
             Some((604, 80))
         );
         assert_eq!(
-            screen_extent_rebase((604, 100), (604, 80, 792, 566), frame),
+            screen_extent_rebase((604, 100, 792, 566), (604, 80, 792, 566), frame),
             None
         );
         assert_eq!(
-            screen_extent_rebase((604, 80), (604, 80, 792, 566), frame),
+            screen_extent_rebase((604, 80, 792, 566), (604, 80, 792, 566), frame),
             None
         );
     }
 
     #[test]
     fn a_renderer_local_frame_at_the_corner_keeps_its_rebase() {
+        let window = (5, 29, 640, 480);
         assert_eq!(
-            screen_extent_rebase((5, 29), (0, 0, 640, 480), Some((0, 0, 650, 514))),
+            screen_extent_rebase(window, (0, 0, 640, 480), Some((0, 0, 650, 514))),
             Some((5, 29))
         );
         assert_eq!(
-            screen_extent_rebase((5, 56), (0, 0, 640, 480), Some((0, 27, 650, 514))),
+            screen_extent_rebase((5, 56, 640, 480), (0, 0, 640, 480), Some((0, 27, 650, 514))),
             Some((5, 56))
         );
         assert_eq!(
-            screen_extent_rebase((5, 29), (0, 0, 640, 480), None),
+            screen_extent_rebase(window, (0, 0, 640, 480), None),
             Some((5, 29))
         );
     }
@@ -6837,7 +6849,21 @@ mod coord_tests {
     #[test]
     fn a_gtk_frame_matching_its_window_manager_frame_at_the_corner_is_not_rebased() {
         assert_eq!(
-            screen_extent_rebase((5, 29), (0, 0, 650, 514), Some((0, 0, 650, 514))),
+            screen_extent_rebase((5, 29, 640, 480), (0, 0, 650, 514), Some((0, 0, 650, 514))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_frame_of_another_window_is_not_rebased_onto_a_popup() {
+        let popup = (171, 205, 155, 33);
+        assert_eq!(
+            screen_extent_rebase(popup, (0, 0, 1280, 27), Some(popup)),
+            None
+        );
+        let popup = (1086, 513, 173, 287);
+        assert_eq!(
+            screen_extent_rebase(popup, (0, 0, 1280, 800), Some(popup)),
             None
         );
     }
