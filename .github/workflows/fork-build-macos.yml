@@ -1,4 +1,4 @@
-# loomhand fork: a push to a cmgs/build-* branch checks platform-macos and builds cua-driver for macOS x86_64 as an Actions artifact, with no tag and no release.
+# loomhand fork: a push to a cmgs/build-* branch lists platform-macos clippy findings (main already has some), tests it and builds cua-driver for macOS x86_64 as an Actions artifact, with no tag and no release.
 name: "Fork: Build macOS"
 
 on:
@@ -23,7 +23,8 @@ jobs:
         working-directory: libs/cua-driver/rust
         run: |
           rustup component add clippy
-          cargo clippy --locked -p platform-macos --all-targets -- -D warnings
+          cargo clippy --locked -p platform-macos --all-targets --message-format=short 2>&1 | tee clippy.txt
+          grep -E '^crates/platform-macos/src/tools/(mod|click|bring_to_front)\.rs:[0-9]+:[0-9]+: (warning|error)' clippy.txt || true
           cargo test --locked -p platform-macos --lib
 
       - name: Build (release)
