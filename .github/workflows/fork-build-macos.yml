@@ -1,0 +1,50 @@
+# loomhand fork: a push to a cmgs/build-* branch checks platform-macos and builds cua-driver for macOS x86_64 as an Actions artifact, with no tag and no release.
+name: "Fork: Build macOS"
+
+on:
+  push:
+    branches: ["cmgs/build-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    # macos-26 carries the macOS 26 SDK that screencapturekit needs, as upstream's release build notes.
+    runs-on: macos-26
+    env:
+      CUA_TELEMETRY: "0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Check
+        working-directory: libs/cua-driver/rust
+        run: |
+          rustup component add clippy
+          cargo clippy --locked -p platform-macos --all-targets -- -D warnings
+          cargo test --locked -p platform-macos --lib
+
+      - name: Build (release)
+        working-directory: libs/cua-driver/rust
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --locked -p cua-driver -p cursor-theme-cli --release --target x86_64-apple-darwin
+
+      - name: Package
+        working-directory: libs/cua-driver/rust
+        run: |
+          set -eu
+          stage="cua-driver-${GITHUB_SHA}-macos-x86_64"
+          out="target/x86_64-apple-darwin/release"
+          mkdir -p "dist/$stage"
+          cp "$out/cua-driver" "$out/cua-cursor-theme" "dist/$stage/"
+          tar -czf "dist/$stage.tar.gz" -C dist "$stage"
+          shasum -a 256 "dist/$stage.tar.gz"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: cua-driver-macos-x86_64
+          path: libs/cua-driver/rust/dist/*.tar.gz
