@@ -754,20 +754,124 @@ pub fn load_driver_config() -> DriverConfig {
 /// used by CoreGraphics input APIs. Retina scaled modes cannot rely on the
 /// nominal backing factor alone, so derive the ratio from the actual PNG.
 pub async fn desktop_screenshot_point(x: f64, y: f64) -> (f64, f64) {
-    let ratio = tokio::task::spawn_blocking(|| {
-        let logical_w = get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
+    let ratio = tokio::task::spawn_blocking(desktop_pixel_ratio)
+        .await
+        .unwrap_or(1.0);
+    (x / ratio, y / ratio)
+}
+
+/// The main display and its current mode; the desktop pixel ratio holds while
+/// this is unchanged.
+type DisplayModeKey = (u32, i64, u64, u64, u64, u64);
+
+static DESKTOP_PIXEL_RATIO: std::sync::Mutex<Option<(DisplayModeKey, f64)>> =
+    std::sync::Mutex::new(None);
+
+/// Native desktop screenshot width over the logical main-display width. A
+/// screenshot measures it once per display mode instead of once per action.
+pub(crate) fn desktop_pixel_ratio() -> f64 {
+    cached_desktop_pixel_ratio(&DESKTOP_PIXEL_RATIO, display_mode_key(), || {
+        let logical_w = get_screen_size::main_screen_size().map(|(w, _, _)| w as f64)?;
         let shot_w = crate::capture::screenshot_display_bytes()
             .ok()
             .and_then(|png| crate::capture::png_dimensions(&png).ok())
-            .map(|(w, _)| w as f64);
-        match (shot_w, logical_w) {
-            (Some(sw), Some(lw)) if lw > 0.0 && sw > lw => sw / lw,
-            _ => 1.0,
-        }
+            .map(|(w, _)| w as f64)?;
+        Some(if logical_w > 0.0 && shot_w > logical_w {
+            shot_w / logical_w
+        } else {
+            1.0
+        })
     })
-    .await
-    .unwrap_or(1.0);
-    (x / ratio, y / ratio)
+}
+
+fn display_mode_key() -> Option<DisplayModeKey> {
+    use core_graphics::display::{CGDisplay, CGDisplayBounds, CGMainDisplayID};
+
+    // SAFETY: CGMainDisplayID / CGDisplayBounds are thread-safe CG APIs.
+    let id = unsafe { CGMainDisplayID() };
+    if id == 0 {
+        return None;
+    }
+    let bounds = unsafe { CGDisplayBounds(id) };
+    let mode = CGDisplay::new(id).display_mode()?;
+    Some((
+        id,
+        bounds.size.width as i64,
+        mode.width(),
+        mode.height(),
+        mode.pixel_width(),
+        mode.pixel_height(),
+    ))
+}
+
+/// The ratio stored for `key`, else `measure`'s, stored for `key` when both
+/// exist. A failed measurement returns 1.0 and is measured again next time.
+fn cached_desktop_pixel_ratio(
+    cache: &std::sync::Mutex<Option<(DisplayModeKey, f64)>>,
+    key: Option<DisplayModeKey>,
+    measure: impl FnOnce() -> Option<f64>,
+) -> f64 {
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let (Some(key), Some((stored, ratio))) = (key, *cached) {
+        if stored == key {
+            return ratio;
+        }
+    }
+    let Some(ratio) = measure() else {
+        return 1.0;
+    };
+    if let Some(key) = key {
+        *cached = Some((key, ratio));
+    }
+    ratio
+}
+
+#[cfg(test)]
+mod desktop_pixel_ratio_tests {
+    use super::*;
+
+    const RETINA: DisplayModeKey = (1, 1512, 1512, 982, 3024, 1964);
+    const SCALED: DisplayModeKey = (1, 1728, 1728, 1117, 3456, 2234);
+
+    #[test]
+    fn a_display_mode_is_measured_once_and_again_after_it_changes() {
+        let cache = std::sync::Mutex::new(None);
+        let mut measured = 0;
+        let mut measure = |ratio| {
+            measured += 1;
+            Some(ratio)
+        };
+        assert_eq!(
+            cached_desktop_pixel_ratio(&cache, Some(RETINA), || measure(2.0)),
+            2.0
+        );
+        assert_eq!(
+            cached_desktop_pixel_ratio(&cache, Some(RETINA), || measure(9.0)),
+            2.0
+        );
+        assert_eq!(
+            cached_desktop_pixel_ratio(&cache, Some(SCALED), || measure(2.0)),
+            2.0
+        );
+        assert_eq!(measured, 2);
+    }
+
+    #[test]
+    fn a_failed_measurement_or_unknown_mode_is_not_stored() {
+        let cache = std::sync::Mutex::new(None);
+        assert_eq!(
+            cached_desktop_pixel_ratio(&cache, Some(RETINA), || None),
+            1.0
+        );
+        assert_eq!(cached_desktop_pixel_ratio(&cache, None, || Some(2.0)), 2.0);
+        assert_eq!(
+            cached_desktop_pixel_ratio(&cache, Some(RETINA), || Some(2.0)),
+            2.0
+        );
+        assert_eq!(*cache.lock().unwrap(), Some((RETINA, 2.0)));
+    }
 }
 
 /// Persist a single key/value pair to `~/.cua-driver/config.json`.
